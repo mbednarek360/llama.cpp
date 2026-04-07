@@ -220,7 +220,7 @@ server_models::server_models(
             ggml_backend_dev_memory(dev, &free, &total);
             if (total > 0) {
                 const uint64_t available = (free > memory_margin) ? free - memory_margin : 0;
-                memory_per_device[dev] = available;
+                available_memory_per_device[dev] = available;
                 SRV_DBG("device %s: available memory after margin=%lu MB\n",
                     ggml_backend_dev_name(dev),
                     (unsigned long)(available / (1024 * 1024)));
@@ -708,7 +708,7 @@ uint64_t server_models::get_memory_exceeded(const model_memory_map& new_model_me
     model_memory_map total_memory_per_device;
     for (const auto & m : mapping) {
         if (m.second.meta.is_running()) {
-            for (const auto& [key, value] : m.second.meta.memory_per_device) {
+            for (const auto& [key, value] : m.second.meta.memory_usage_per_device) {
                 total_memory_per_device[key] += value;
             }
         }
@@ -721,7 +721,7 @@ uint64_t server_models::get_memory_exceeded(const model_memory_map& new_model_me
 
     uint64_t memory_exceeded = 0;
 
-    for (const auto& [key, limit] : memory_per_device) {
+    for (const auto& [key, limit] : available_memory_per_device) {
         const uint64_t total_memory = get(total_memory_per_device, key);
         const uint64_t new_memory = get(new_model_memory_per_device, key);
         SRV_DBG("device %s: total=%lu MB, new=%lu MB, limit=%lu MB\n",
@@ -739,7 +739,7 @@ uint64_t server_models::get_memory_exceeded(const model_memory_map& new_model_me
 }
 
 void server_models::unload_lru(const model_memory_map& new_model_memory_per_device) {
-    const bool check_memory = base_params.models_memory_margin > 0 && !memory_per_device.empty();
+    const bool check_memory = base_params.models_memory_margin > 0 && !available_memory_per_device.empty();
 
     if (base_params.models_max <= 0 && !check_memory) {
         return; // no limit
@@ -849,11 +849,11 @@ void server_models::load(const std::string & name) {
     if (base_params.models_memory_margin > 0) {
         std::lock_guard<std::mutex> lk(mutex);
         auto & meta = mapping[name].meta;
-        if (meta.memory_per_device.empty()) {
-            meta.memory_per_device = get_model_memory_per_device(meta.preset);
+        if (meta.memory_usage_per_device.empty()) {
+            meta.memory_usage_per_device = get_model_memory_per_device(meta.preset);
         }
 
-        new_model_memory_per_device = meta.memory_per_device;
+        new_model_memory_per_device = meta.memory_usage_per_device;
     }
 
     unload_lru(new_model_memory_per_device);

@@ -64,7 +64,7 @@ struct server_model_meta {
     int port = 0;
     server_model_status status = SERVER_MODEL_STATUS_UNLOADED;
     int64_t last_used = 0; // for LRU unloading
-    model_memory_map memory_per_device; // projected bytes per device
+    model_memory_map memory_usage_per_device; // bytes used per device
     std::vector<std::string> args; // args passed to the model instance, will be populated by render_args()
     json loaded_info; // info to be reflected via /v1/models endpoint
     int exit_code = 0; // exit code of the model instance process (only valid if status == FAILED)
@@ -117,7 +117,7 @@ private:
     common_preset base_preset; // base preset from llama-server CLI args
 
     // available memory per device
-    std::map<ggml_backend_dev_t, uint64_t> memory_per_device;
+    std::map<ggml_backend_dev_t, uint64_t> available_memory_per_device;
 
     void update_meta(const std::string & name, const server_model_meta & meta);
 
