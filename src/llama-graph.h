@@ -97,6 +97,20 @@ struct llama_eagle3 {
     }
 };
 
+// DFlash intermediate results struct (similar to Eagle3)
+struct llama_dflash {
+    std::vector<int> extract_layer_indices;
+
+    std::vector<float> target_features;
+
+    std::vector<ggml_tensor *> extract_tensors;
+
+    void clear() {
+        target_features.clear();
+        extract_tensors.clear();
+    }
+};
+
 struct llm_graph_params;
 
 //
@@ -569,6 +583,7 @@ struct llm_graph_params {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     llama_eagle3                 * eagle3;  // non-const: we write extracted features here
+    llama_dflash                 * dflash;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -784,6 +799,7 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     llama_eagle3                 * eagle3;  // non-const: we write extracted features here
+    llama_dflash                 * dflash;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
