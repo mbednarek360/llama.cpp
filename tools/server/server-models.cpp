@@ -8,8 +8,6 @@
 #include <cpp-httplib/httplib.h> // TODO: remove this once we use HTTP client from download.h
 #include <sheredom/subprocess.h>
 
-#include "../../src/llama-ext.h"
-
 #include <functional>
 #include <algorithm>
 #include <thread>
@@ -813,64 +811,6 @@ static std::string resolve_model_path(const common_preset & preset) {
     return "";
 }
 
-static buft_memory_map get_model_memory_per_buft(const common_preset & preset) {
-    common_params params;
-    preset.apply_to_params(params);
-
-    if (params.model.path.empty()) {
-        params.model.path = resolve_model_path(preset);
-        if (params.model.path.empty()) {
-            return {};
-        }
-    }
-
-    struct log_ud_t {
-        struct {
-            ggml_log_callback callback;
-            void * user_data;
-        } original;
-        ggml_log_level min_level;
-    } log_ud;
-    llama_log_get(&log_ud.original.callback, &log_ud.original.user_data);
-    log_ud.min_level = GGML_LOG_LEVEL_WARN;
-
-    llama_log_set([](ggml_log_level level, const char * text, void * ud) {
-        log_ud_t * d = (log_ud_t *) ud;
-        const ggml_log_level eff = level >= d->min_level ? level : GGML_LOG_LEVEL_DEBUG;
-        d->original.callback(eff, text, d->original.user_data);
-    }, &log_ud);
-
-    llama_model_params mparams = common_model_params_to_llama(params);
-    mparams.no_alloc = true;
-    mparams.use_mmap = false;
-    mparams.use_mlock = false;
-
-    llama_model_ptr model{llama_model_load_from_file(params.model.path.c_str(), mparams)};
-
-    if (!model) {
-        llama_log_set(log_ud.original.callback, log_ud.original.user_data);
-        return {};
-    }
-
-    llama_context_params cparams = common_context_params_to_llama(params);
-    llama_context_ptr ctx{llama_init_from_model(model.get(), cparams)};
-    llama_log_set(log_ud.original.callback, log_ud.original.user_data);
-
-    if (!ctx) {
-        return {};
-    }
-
-    buft_memory_map result;
-    for (const auto & [buft, data] : llama_get_memory_breakdown(ctx.get())) {
-        size_t total = data.total();
-        if (total > 0) {
-            result[buft] = total;
-        }
-    }
-
-    return result;
-}
-
 bool server_models::download_model(const std::string & name) {
     std::vector<std::string> child_args;
     std::vector<std::string> child_env;
@@ -915,10 +855,101 @@ bool server_models::download_model(const std::string & name) {
     return true;
 }
 
+buft_memory_map server_models::estimate_model_memory(const std::string & name) {
+    std::vector<std::string> child_args;
+    std::vector<std::string> child_env;
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        auto & meta = mapping[name].meta;
+        child_args = meta.preset.to_args(bin_path);
+        child_env  = base_env;
+    }
+    child_args.push_back("--measure-only");
+    child_args.push_back("--offline");
+
+    SRV_INF("estimating memory for model name=%s\n", name.c_str());
+
+    std::vector<char *> argv = to_char_ptr_array(child_args);
+    std::vector<char *> envp = to_char_ptr_array(child_env);
+
+    subprocess_s proc;
+    int options = subprocess_option_no_window | subprocess_option_combined_stdout_stderr;
+    if (subprocess_create_ex(argv.data(), options, envp.data(), &proc) != 0) {
+        SRV_ERR("failed to spawn measure process for model name=%s\n", name.c_str());
+        return {};
+    }
+
+    buft_memory_map result;
+    FILE * out = subprocess_stdout(&proc);
+    if (out) {
+        char buffer[4096];
+        while (fgets(buffer, sizeof(buffer), out) != nullptr) {
+            LOG("[measure:%s] %s", name.c_str(), buffer);
+            std::string line(buffer);
+            if (string_starts_with(line, "measure:")) {
+                std::istringstream iss(line.substr(strlen("measure:")));
+                std::string buft_name;
+                size_t size = 0;
+                if (iss >> buft_name >> size) {
+                    ggml_backend_buffer_type_t buft = nullptr;
+                    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                        ggml_backend_buffer_type_t dev_buft = ggml_backend_dev_buffer_type(dev);
+                        if (dev_buft && buft_name == ggml_backend_buft_name(dev_buft)) {
+                            buft = dev_buft;
+                            break;
+                        }
+                    }
+                    if (buft) {
+                        result[buft] = size;
+                    } else {
+                        SRV_WRN("unknown buft name '%s' from measure child for model name=%s\n",
+                            buft_name.c_str(), name.c_str());
+                    }
+                }
+            }
+        }
+    }
+
+    int exit_code = 0;
+    subprocess_join(&proc, &exit_code);
+    subprocess_destroy(&proc);
+
+    if (exit_code != 0) {
+        SRV_ERR("measure process for model name=%s exited with code %d\n", name.c_str(), exit_code);
+        return {};
+    }
+
+    SRV_INF("memory estimation complete for model name=%s\n", name.c_str());
+    return result;
+}
+
+void server_models::join_completed_bg_tasks() {
+    std::vector<std::unique_ptr<bg_task>> to_join;
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        for (auto it = bg_tasks.begin(); it != bg_tasks.end(); ) {
+            if (it->second->done.load()) {
+                to_join.push_back(std::move(it->second));
+                it = bg_tasks.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (auto & task : to_join) {
+        if (task->th.joinable()) {
+            task->th.join();
+        }
+    }
+}
+
 void server_models::load(const std::string & name) {
     if (!has_model(name)) {
         throw std::runtime_error("model name=" + name + " is not found");
     }
+
+    join_completed_bg_tasks();
 
     {
         common_preset preset_copy;
@@ -933,23 +964,34 @@ void server_models::load(const std::string & name) {
                 if (meta.status != SERVER_MODEL_STATUS_UNLOADED) {
                     return;
                 }
+                // skip if a bg_task is already running for this model
+                auto bg_it = bg_tasks.find(name);
+                if (bg_it != bg_tasks.end() && !bg_it->second->done.load()) {
+                    return;
+                }
                 meta.status = SERVER_MODEL_STATUS_DOWNLOADING;
                 cv.notify_all();
             }
-            std::thread([this, name]() {
+
+            auto task = std::make_unique<bg_task>();
+            auto * task_ptr = task.get();
+
+            task->th = std::thread([this, name, task_ptr]() {
                 if (!download_model(name)) {
                     update_status(name, SERVER_MODEL_STATUS_UNLOADED, 1);
+                    task_ptr->done.store(true);
                     return;
                 }
                 buft_memory_map mem;
                 if (base_params.models_memory_margin > 0) {
-                    std::lock_guard<std::mutex> lk(mutex);
-                    auto & meta = mapping[name].meta;
-                    meta.bmm_req = get_model_memory_per_buft(meta.preset);
-                    if (meta.bmm_req.empty()) {
+                    mem = estimate_model_memory(name);
+                    if (mem.empty()) {
                         SRV_WRN("failed to estimate memory for model %s, memory limits will not apply\n", name.c_str());
                     }
-                    mem = meta.bmm_req;
+                    {
+                        std::lock_guard<std::mutex> lk(mutex);
+                        mapping[name].meta.bmm_req = mem;
+                    }
                 }
                 try {
                     _load(name, mem);
@@ -957,24 +999,33 @@ void server_models::load(const std::string & name) {
                     SRV_ERR("failed to load model %s after download: %s\n", name.c_str(), e.what());
                     update_status(name, SERVER_MODEL_STATUS_UNLOADED, 1);
                 }
-            }).detach();
+                task_ptr->done.store(true);
+            });
+
+            {
+                std::lock_guard<std::mutex> lk(mutex);
+                bg_tasks[name] = std::move(task);
+            }
             return;
         }
     }
 
     buft_memory_map bmm_req;
     if (base_params.models_memory_margin > 0) {
-        // determine the required memory by the model upon its first load
-        std::lock_guard<std::mutex> lk(mutex);
-        auto & meta = mapping[name].meta;
-        if (meta.bmm_req.empty()) {
-            meta.bmm_req = get_model_memory_per_buft(meta.preset);
-            if (meta.bmm_req.empty()) {
+        {
+            std::lock_guard<std::mutex> lk(mutex);
+            bmm_req = mapping[name].meta.bmm_req;
+        }
+        if (bmm_req.empty()) {
+            bmm_req = estimate_model_memory(name);
+            if (bmm_req.empty()) {
                 SRV_WRN("failed to estimate memory for model %s, memory limits will not apply\n", name.c_str());
             }
+            {
+                std::lock_guard<std::mutex> lk(mutex);
+                mapping[name].meta.bmm_req = bmm_req;
+            }
         }
-
-        bmm_req = meta.bmm_req;
     }
 
     _load(name, bmm_req);
@@ -1174,6 +1225,7 @@ void server_models::unload(const std::string & name) {
 
 void server_models::unload_all() {
     std::vector<std::thread> to_join;
+    std::vector<std::unique_ptr<bg_task>> bg_to_join;
     {
         std::lock_guard<std::mutex> lk(mutex);
         for (auto & [name, inst] : mapping) {
@@ -1186,15 +1238,26 @@ void server_models::unload_all() {
             // moving the thread to join list to avoid deadlock
             to_join.push_back(std::move(inst.th));
         }
+        for (auto & [name, task] : bg_tasks) {
+            bg_to_join.push_back(std::move(task));
+        }
+        bg_tasks.clear();
     }
     for (auto & th : to_join) {
         if (th.joinable()) {
             th.join();
         }
     }
+    for (auto & task : bg_to_join) {
+        if (task && task->th.joinable()) {
+            task->th.join();
+        }
+    }
 }
 
 void server_models::update_status(const std::string & name, server_model_status status, int exit_code) {
+    join_completed_bg_tasks();
+
     std::unique_lock<std::mutex> lk(mutex);
     auto it = mapping.find(name);
     if (it != mapping.end()) {
