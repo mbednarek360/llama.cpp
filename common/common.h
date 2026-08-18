@@ -172,7 +172,6 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,            // standalone draft model speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,            // Eagle3 speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_MTP,               // Multi-token prediction
-    COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE,      // MTP with adaptive draft depth
     COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,            // DFlash speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,            // DSpark speculative decoding (DFlash + Markov head)
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,            // simple self-speculative decoding based on n-grams
@@ -180,6 +179,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,           // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,             // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE,      // MTP with adaptive draft depth
     COMMON_SPECULATIVE_TYPE_COUNT                    // number of types, unknown type
 };
 
