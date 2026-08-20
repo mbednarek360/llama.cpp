@@ -50,8 +50,8 @@ static void test_climb(void) {
     assert(ctrl.n_cur == 3);
     assert(ctrl.n_bucket == 20);
 
-    // depth 3 is the hardened barrier: 9 net full accepts to reach depth 4 (cap 29)
-    for (int i = 0; i < 8; ++i) {
+    // depth 3 is the hardened barrier: 10 net full accepts to reach depth 4 (cap 30)
+    for (int i = 0; i < 9; ++i) {
         ctrl.update(3, 3, 8, 1);
         assert(ctrl.n_cur == 3);
     }
@@ -59,13 +59,15 @@ static void test_climb(void) {
     assert(ctrl.n_cur == 4);
     assert(ctrl.n_bucket == 20);
 
-    // a draft truncated one token short of the depth is neutral, exactly like
-    // a full-length draft that fell one token short
+    // a draft truncated one token short of the depth is a small loss, not
+    // neutral: the p_min gate cut it short, so it drains 1 instead of the
+    // full 2 that a miss of the same length would
     ctrl.update(3, 3, 8, 1); // depth 4, only 3 tokens drafted, all accepted
     assert(ctrl.n_cur == 4);
-    assert(ctrl.n_bucket == 20);
+    assert(ctrl.n_bucket == 19);
 
-    // depth 4 needs 6 net full accepts (cap 26)
+    // depth 4 needs 5 net full accepts (cap 25); the truncated draft above
+    // drained 1, so it takes 6 full accepts to climb from here
     for (int i = 0; i < 5; ++i) {
         ctrl.update(4, 4, 8, 1);
     }
@@ -74,8 +76,8 @@ static void test_climb(void) {
     assert(ctrl.n_cur == 5);
     assert(ctrl.n_bucket == 25);
 
-    // depth 5 needs 5 net full accepts (cap 30)
-    for (int i = 0; i < 4; ++i) {
+    // depth 5 needs 4 net full accepts (cap 29)
+    for (int i = 0; i < 3; ++i) {
         ctrl.update(5, 5, 8, 1);
     }
     assert(ctrl.n_cur == 5);
@@ -83,8 +85,8 @@ static void test_climb(void) {
     assert(ctrl.n_cur == 6);
     assert(ctrl.n_bucket == 30);
 
-    // depth 6 needs 4 net full accepts (cap 34)
-    for (int i = 0; i < 3; ++i) {
+    // depth 6 needs 3 net full accepts (cap 33)
+    for (int i = 0; i < 2; ++i) {
         ctrl.update(6, 6, 8, 1);
     }
     assert(ctrl.n_cur == 6);
@@ -92,26 +94,24 @@ static void test_climb(void) {
     assert(ctrl.n_cur == 7);
     assert(ctrl.n_bucket == 35);
 
-    // depth 7 needs 3 net full accepts (cap 38)
-    for (int i = 0; i < 2; ++i) {
-        ctrl.update(7, 7, 8, 1);
-    }
+    // depth 7 needs 2 net full accepts (cap 37)
+    ctrl.update(7, 7, 8, 1);
     assert(ctrl.n_cur == 7);
     ctrl.update(7, 7, 8, 1);
     assert(ctrl.n_cur == 8);
     assert(ctrl.n_bucket == 40);
 
-    // at the ceiling the bucket re-baselines instead of growing unbounded
+    // at the ceiling the bucket saturates at the cap instead of growing unbounded
     for (int i = 0; i < 8; ++i) {
         ctrl.update(8, 8, 8, 1);
     }
     assert(ctrl.n_cur == 8);
-    assert(ctrl.n_bucket == 40);
+    assert(ctrl.n_bucket == 42);
 
     // no feedback for a zero-length draft
     ctrl.update(0, 0, 8, 1);
     assert(ctrl.n_cur == 8);
-    assert(ctrl.n_bucket == 40);
+    assert(ctrl.n_bucket == 42);
 }
 
 static void test_drop(void) {
@@ -205,8 +205,8 @@ static void test_momentum(void) {
     assert(ctrl.n_bucket == 20);
     assert(ctrl.n_cur == 3); // no climb: the old controller would have climbed here
 
-    // 9 more full accepts reach the hardened cap of 29 and climb
-    for (int i = 0; i < 9; ++i) {
+    // 10 more full accepts reach the hardened cap of 30 and climb
+    for (int i = 0; i < 10; ++i) {
         ctrl.update(3, 3, 8, 1);
     }
     assert(ctrl.n_cur == 4);
@@ -219,45 +219,50 @@ static void test_truncation(void) {
     ctrl.n_cur    = 5;
     ctrl.n_bucket = 25;
 
-    // truncated one token short of the depth: neutral, like a near miss
+    // truncated one token short of the depth: the halved 1-token loss rounds
+    // up to a full 1, never to neutral
     ctrl.update(4, 4, 8, 1);
-    assert(ctrl.n_bucket == 25);
-
-    // truncated two tokens short: -1
-    ctrl.update(3, 3, 8, 1);
     assert(ctrl.n_bucket == 24);
 
-    // truncated three tokens short: -2
-    ctrl.update(2, 2, 8, 1);
-    assert(ctrl.n_bucket == 22);
+    // truncated two tokens short: a 2-token loss halved to -1
+    ctrl.update(3, 3, 8, 1);
+    assert(ctrl.n_bucket == 23);
 
-    // truncated and partly rejected drains more
+    // truncated three tokens short: a 3-token loss halved to -2
+    ctrl.update(2, 2, 8, 1);
+    assert(ctrl.n_bucket == 21);
+
+    // truncated and partly rejected drains in full: a drafted token was
+    // rejected, so it is a real miss, not a truncation, and costs -3
     ctrl.update(2, 1, 8, 1);
-    assert(ctrl.n_bucket == 19);
+    assert(ctrl.n_bucket == 18);
 
     // a full-length near miss is neutral, a full-length total miss is -4
     ctrl.update(5, 4, 8, 1);
-    assert(ctrl.n_bucket == 19);
+    assert(ctrl.n_bucket == 18);
     ctrl.update(5, 0, 8, 1);
-    assert(ctrl.n_bucket == 15);
+    assert(ctrl.n_bucket == 14);
 }
 
 static void test_floor(void) {
     common_speculative_adaptive ctrl;
 
     // with the floor at 2 the depth never drops below 2, no matter how bad
-    // the content gets, and the bucket stays at the reset point (misses free)
+    // the content gets; the bucket clamps at 0 instead
     ctrl.reset(8, 2);
     for (int i = 0; i < 1000; ++i) {
         ctrl.update(2, 0, 8, 2);
     }
     assert(ctrl.n_cur == 2);
-    assert(ctrl.n_bucket == 20);
+    assert(ctrl.n_bucket == 0);
 
-    // climbs still work from the floor
-    for (int i = 0; i < 5; ++i) {
+    // climbs still work from the floor: from a clamped 0 it takes the full
+    // drop pressure plus the climb cost, i.e. 25 full accepts at depth 2
+    for (int i = 0; i < 24; ++i) {
         ctrl.update(2, 2, 8, 2);
+        assert(ctrl.n_cur == 2);
     }
+    ctrl.update(2, 2, 8, 2);
     assert(ctrl.n_cur == 3);
     assert(ctrl.n_bucket == 20);
 
@@ -267,11 +272,46 @@ static void test_floor(void) {
     }
     assert(ctrl.n_cur == 2);
     assert(ctrl.n_bucket == 20);
-    for (int i = 0; i < 90; ++i) {
-        ctrl.update(2, 0, 8, 2);
+    for (int i = 0; i < 20; ++i) {
+        ctrl.update(2, 0, 8, 2); // 20 misses drain the 20-token bucket
     }
     assert(ctrl.n_cur == 2);
+    assert(ctrl.n_bucket == 0); // clamped at 0, not dropped
+}
+
+static void test_pinned(void) {
+    common_speculative_adaptive ctrl;
+
+    // with the floor at the ceiling the depth is pinned: it cannot climb
+    // above n_max or drop below n_min_adaptive, and the bucket clamps at
+    // both ends instead of changing the depth
+    ctrl.reset(3, 3);
+    assert(ctrl.n_cur == 3);
     assert(ctrl.n_bucket == 20);
+
+    // full accepts saturate the bucket at the cap (30), the depth stays 3
+    for (int i = 0; i < 100; ++i) {
+        ctrl.update(3, 3, 3, 3);
+    }
+    assert(ctrl.n_cur == 3);
+    assert(ctrl.n_bucket == 30);
+
+    // total misses drain the bucket and clamp at 0, the depth stays 3
+    for (int i = 0; i < 100; ++i) {
+        ctrl.update(3, 0, 3, 3);
+    }
+    assert(ctrl.n_cur == 3);
+    assert(ctrl.n_bucket == 0);
+
+    // it recovers from the clamped 0: 30 full accepts refill the bucket
+    for (int i = 0; i < 29; ++i) {
+        ctrl.update(3, 3, 3, 3);
+        assert(ctrl.n_cur == 3);
+    }
+    assert(ctrl.n_bucket == 29);
+    ctrl.update(3, 3, 3, 3);
+    assert(ctrl.n_cur == 3);
+    assert(ctrl.n_bucket == 30); // saturated at the cap again
 }
 
 int main(void) {
@@ -281,6 +321,7 @@ int main(void) {
     test_momentum();
     test_truncation();
     test_floor();
+    test_pinned();
 
     printf("test-speculative-adaptive: all tests OK\n\n");
 

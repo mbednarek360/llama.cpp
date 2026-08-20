@@ -31,18 +31,18 @@
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
 
 const std::map<std::string, common_speculative_type> common_speculative_type_from_name_map = {
-    {"none",          COMMON_SPECULATIVE_TYPE_NONE},
-    {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
-    {"draft-eagle3",  COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3},
-    {"draft-mtp",     COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
+    {"none",               COMMON_SPECULATIVE_TYPE_NONE},
+    {"draft-simple",       COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
+    {"draft-eagle3",       COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3},
+    {"draft-mtp",          COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
     {"draft-mtp-adaptive", COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE},
-    {"draft-dflash",  COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH},
-    {"draft-dspark",  COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK},
-    {"ngram-simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
-    {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
-    {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
-    {"ngram-mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    {"draft-dflash",       COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH},
+    {"draft-dspark",       COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK},
+    {"ngram-simple",       COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
+    {"ngram-map-k",        COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
+    {"ngram-map-k4v",      COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
+    {"ngram-mod",          COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
+    {"ngram-cache",        COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
 };
 
 static std::string common_speculative_get_devices_str(const std::vector<ggml_backend_dev_t> & devices) {
@@ -1448,6 +1448,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
+        }
+
+        // new generation: the depth learned for the previous content is stale,
+        // so the controller starts from the floor again
+        if (adaptive) {
+            adaptive_ctrl[seq_id].reset(this->params.n_max, this->params.n_min_adaptive);
         }
 
         auto * ctx_dft = this->params.ctx_dft;
