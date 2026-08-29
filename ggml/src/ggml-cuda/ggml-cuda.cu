@@ -2608,6 +2608,33 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     return cgraph->nodes[0];
 }
 
+// Whether a CUDA/HIP graph carries a multi-token batch (a PRE-FILL or a spec-verify
+// batch).  The first node's ne[1] is NOT a reliable token count: with expert offload
+// (-ncmoe) the scheduler splits the graph around the CPU-resident experts, so a
+// one-token decode split routinely starts with an expert-path tensor of shape
+// [n_ff, n_expert_used, n_tokens] and ne[1] == n_expert_used (10) even at one token.
+// Read the token count from the first op that actually carries it instead:
+//   - MUL_MAT_ID  -> result is [n_out, n_expert_used, n_tokens], so ne[2] is n_tokens
+//   - MUL_MAT     -> result is [src0->ne[1], src1->ne[1], ...], so src1->ne[1] is n_tokens
+// The MUL_MAT arm requires a constant, unbatched weight (src0 is op NONE and 2-D) so the
+// probe reads a layer's activation batch; attention score matmuls are skipped.
+static bool ggml_cuda_graph_is_multi_token(const ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+
+        if (node->op == GGML_OP_MUL_MAT_ID) {
+            return node->ne[2] > 1;
+        }
+        if (node->op == GGML_OP_MUL_MAT && node->src[0] != nullptr && node->src[1] != nullptr &&
+            node->src[0]->op == GGML_OP_NONE && node->src[0]->ne[2] == 1) {
+            return node->src[1]->ne[1] > 1;
+        }
+    }
+
+    // No weight matmul found in this split: fall back to the first node's second dim.
+    return cgraph->n_nodes > 0 && cgraph->nodes[0]->ne[1] > 1;
+}
+
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
     bool res = false;
 
@@ -2652,6 +2679,28 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 
 static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+
+#ifdef GGML_USE_HIP
+    // HIP/ROCm <= 10.0 leaks device memory in hipGraphExecUpdate: the driver's
+    // GraphKernelArgManager bump-allocates a fresh kernel-argument slot on every update
+    // and only reclaims slots when the exec is destroyed (ROCm/rocm-systems#10713; driver
+    // fix in PR #11434).  A split-moe decode recaptures the graph on the order of once per
+    // few tokens, so a long-lived exec grows by a few KB per token.  Destroying and
+    // re-instantiating is the only reclaim path that exists today and was measured flat
+    // over a soak; it also cannot leave a stale executable behind, which the update path
+    // can silently do when the driver drops an error.  Cheap in practice: this runs only
+    // on the recapture path, not per token.  Set GGML_HIP_GRAPH_FORCE_UPDATE=1 to take the
+    // update path anyway (e.g. on a ROCm that has the driver fix).
+    static const bool force_update = getenv("GGML_HIP_GRAPH_FORCE_UPDATE") != nullptr;
+    if (!force_update) {
+        if (graph->instance != nullptr) {
+            CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+            graph->instance = nullptr;
+        }
+        CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+        return;
+    }
+#endif // GGML_USE_HIP
 
 #if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
@@ -5061,6 +5110,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (!op_timing && graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
+            // PRE-FILL graphs use varying ubatch sizes, so each is a separate graph
+            // key and CUDA-graph capture never amortizes: the per-call update_required
+            // probe + failed capture is pure overhead. Measured pp512 is ~6.7% faster
+            // with graphs OFF. Only single-token decode (stable shape) benefits from
+            // graph replay. Skip the whole graph path (incl. the update_required probe)
+            // for multi-token graphs. Note this must not use nodes[0]->ne[1] directly:
+            // a split-MoE decode split can start on an expert tensor whose ne[1] is
+            // n_expert_used (see ggml_cuda_graph_is_multi_token).
+            if (ggml_cuda_graph_is_multi_token(cgraph)) {
+                use_cuda_graph = false;
+            } else {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
             if (!graph->warmup_complete) {
@@ -5083,6 +5143,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     cuda_graph_update_required = graph->instance == nullptr;
                 }
             }
+            } // else: not prefill
         }
     }
 #endif // USE_CUDA_GRAPH
