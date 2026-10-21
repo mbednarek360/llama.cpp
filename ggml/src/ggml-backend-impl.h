@@ -445,6 +445,15 @@ extern "C" {
         // table fits per slot.  Appended like the fields above.
         size_t (*slab_ring_slots)(ggml_backend_dev_t dev);
 
+        // (optional) wip/host-expert-master-drop (TODO #55): the host buffer type a POOL-BACKED host
+        // expert master should use (device-carrying but NOT pinned), or NULL when the backend keeps its
+        // pinned host master.  With `--host-experts pool` the loader then backs host expert tensors with
+        // the read-only model mapping and every GPU read is served through the bounded pinned pool.  It is
+        // APPENDED at the very end (not next to the other moe_cache fields) because several backends
+        // already initialize the fields above positionally -- inserting in the middle would alias their
+        // entries.  Zero-initialized for backends that do not set it.
+        ggml_backend_buffer_type_t (*moe_host_master_buft)(ggml_backend_dev_t dev);
+
         // (optional) TODO #59: the MoE expert cache's decode/verify band in tokens (the widest routed
         // `MUL_MAT_ID` batch the arena serves from VRAM), or 0 when the cache is disabled.  `common` clamps
         // the draftless (n-gram) speculators' draft length to `band - 1` so a speculative verify batch never

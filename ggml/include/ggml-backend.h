@@ -279,6 +279,20 @@ extern "C" {
     GGML_API ggml_backend_buffer_type_t    ggml_backend_dev_host_buffer_type(ggml_backend_dev_t device);
     GGML_API ggml_backend_buffer_t         ggml_backend_dev_buffer_from_host_ptr(ggml_backend_dev_t device, void * ptr, size_t size, size_t max_tensor_size);
 
+    // wip/host-expert-master-drop (TODO #55): the host buffer type a POOL-BACKED host expert MASTER should
+    // use, or NULL when the backend has no such mode (then host expert weights stay in the pinned host
+    // buffer).  The returned type is a host buffer type that carries its device (so the scheduler still
+    // places the expert op on that GPU) but whose allocation is NOT pinned: with `--host-experts pool` the
+    // loader backs the tensor with the read-only model mapping (page cache) and every GPU read of it is
+    // served through the bounded pinned host pool.
+    GGML_API ggml_backend_buffer_type_t    ggml_backend_dev_moe_host_master_buft(ggml_backend_dev_t device);
+
+    // Wrap an existing host pointer (for example a range of the read-only model mapping) in a buffer of
+    // `buft` without taking ownership of it, so tensors can be placed directly in it.  Returns NULL when
+    // `buft` is not a host type, does not carry a device (that is what keeps such tensors on the GPU
+    // backend's schedule), or cannot hold a `max_tensor_size` tensor.
+    GGML_API ggml_backend_buffer_t         ggml_backend_host_buffer_from_ptr(ggml_backend_buffer_type_t buft, void * ptr, size_t size, size_t max_tensor_size);
+
     GGML_API bool                          ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op);
     GGML_API bool                          ggml_backend_dev_supports_buft(ggml_backend_dev_t device, ggml_backend_buffer_type_t buft);
     GGML_API bool                          ggml_backend_dev_offload_op(ggml_backend_dev_t device, const struct ggml_tensor * op);

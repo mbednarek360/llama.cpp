@@ -268,6 +268,18 @@ bool moe_cache_gather_host(const struct ggml_tensor * weight, const struct ggml_
                            const struct ggml_tensor * ids, void * stream, int device,
                            size_t slice_off, int split_axis);
 
+// wip/host-expert-master-drop (TODO #55): true when `p` lies inside a host expert master that is NOT
+// pinned (the pool-backed, file-mapping-backed master).  A device copy must not treat such a pointer as a
+// pinned source, and a kernel must not read it in place.
+bool moe_cache_source_pageable(const void * p);
+
+// wip/host-expert-master-drop (TODO #55): copy `size` bytes of a POOL-BACKED host expert master (the
+// pageable model mapping) at `src_host` into the device pointer `dst`, staging through the pinned pool or
+// the per-table pinned bounce -- never a pageable H2D.  Returns false when `src_host` is not inside a
+// registered pool-backed master of `device` (the caller keeps its normal copy path), so this is safe to
+// call for every host-to-device upload.
+bool moe_cache_upload_pageable(void * dst, const void * src_host, size_t size, void * stream, int device);
+
 // Fill a whole-table staging copy from the expert-cache arena (the
 // immutable prefill residency snapshot) + the pinned host master, instead of re-uploading every expert
 // over PCIe.  `host_src`/`offset` identify a registered table; `width`/`stride_src`/`n_copies` are the

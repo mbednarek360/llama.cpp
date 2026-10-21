@@ -1969,7 +1969,48 @@ bool llama_model_base::load_tensors(llama_model_loader & ml_l) {
         const bool is_lazy_mapped = ctx_key.lazy && !ml_l.no_alloc;
         const bool is_resident    = ctx_key.resident;
 
-        if ((ml_l.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft && !is_resident) {
+        // wip/host-expert-master-drop (TODO #55): a POOL-BACKED host expert master keeps its tensors in
+        // the read-only model mapping instead of a full pinned allocation (`--host-experts pool`).  The
+        // mapping is the source of truth (page cache / GGUF on disk, reclaimable), the bounded pinned
+        // pool is the only non-swappable tier, and every GPU read is served through it -- so a host
+        // expert set larger than RAM runs by streaming from disk.  The buffer type still carries this
+        // device, so the expert op stays on the GPU and nothing about the schedule changes.
+        const bool host_master_mapped = ml_l.use_mmap && !ml_l.no_alloc && dev != nullptr && buft != nullptr &&
+            buft == ggml_backend_dev_moe_host_master_buft(dev);
+
+        if (host_master_mapped) {
+            for (uint32_t idx = 0; idx < ml_l.files.size(); idx++) {
+                // only the mmap region containing this context's tensors of this file
+                void * addr = nullptr;
+                size_t first, last; // NOLINT
+                ml_l.get_mapping_range(&first, &last, &addr, idx, ctx);
+                if (first >= last) {
+                    continue;
+                }
+                const size_t max_size = ggml_get_max_tensor_size(ctx);
+                ggml_backend_buffer_t buf = ggml_backend_host_buffer_from_ptr(
+                        buft, (char *) addr + first, last - first, max_size);
+                if (buf == nullptr) {
+                    throw std::runtime_error(format("unable to map %s buffer over the model mapping (range %zu..%zu); "
+                                                    "use --host-experts pinned or a smaller tensor layout",
+                                                    ggml_backend_buft_name(buft), first, last));
+                }
+                bufs.emplace_back(buf);
+                buf_map.emplace(idx, buf);
+
+                // the tensors point directly into the mapping: the page must survive the load
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                    const auto * w = ml_l.get_weight(ggml_get_name(t));
+                    if (w != nullptr && (uint32_t) w->idx == idx) {
+                        ml_l.mark_mmap_used(idx, w->offs, ggml_nbytes(t));
+                    }
+                }
+            }
+            if (bufs.empty()) {
+                throw std::runtime_error(format("host expert master: no mapped range covers the %s expert tensors",
+                                                ggml_backend_buft_name(buft)));
+            }
+        } else if ((ml_l.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft && !is_resident) {
             GGML_ASSERT(!ml_l.no_alloc);
             for (uint32_t idx = 0; idx < ml_l.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
@@ -2510,6 +2551,42 @@ size_t llama_model::max_host_weight_tensor_bytes() const {
         }
     }
     return max_bytes;
+}
+
+size_t llama_model::max_host_expert_slice_bytes() const {
+    // issue #164: the per-device slice of a host expert table is not the table divided by the device count
+    // -- the meta split is granularity-rounded and came out 180 MiB / 270 MiB on a 450 MiB table with two
+    // devices.  Ask the split-state callback (the same one the meta backend uses for the staging copies)
+    // and the shared size rule, so this and the staging always agree.
+    const size_t n_devs = get_split_state_ud.n_devices;
+    const bool   split  = n_devs > 1 && n_devs <= GGML_BACKEND_META_MAX_DEVICES && get_split_state_ud.model != nullptr;
+    size_t max_slice = 0;
+    for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+        ggml_context * c = ctx.get();
+        for (ggml_tensor * t = ggml_get_first_tensor(c); t != nullptr; t = ggml_get_next_tensor(c, t)) {
+            if (t->buffer == nullptr || !ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            if (ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                continue;
+            }
+            if (std::string(t->name).find("exps") == std::string::npos) {
+                continue;
+            }
+            if (split) {
+                const ggml_backend_meta_split_state ss = llama_meta_device_get_split_state(t, const_cast<void *>(static_cast<const void *>(&get_split_state_ud)));
+                for (size_t d = 0; d < n_devs; d++) {
+                    const size_t b = ggml_backend_meta_split_dev_bytes(t, &ss, n_devs, d);
+                    if (b > max_slice) {
+                        max_slice = b;
+                    }
+                }
+            } else if (ggml_nbytes(t) > max_slice) {
+                max_slice = ggml_nbytes(t);
+            }
+        }
+    }
+    return max_slice;
 }
 
 uint64_t llama_model::n_elements() const {

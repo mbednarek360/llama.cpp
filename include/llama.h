@@ -227,7 +227,12 @@ extern "C" {
         LLAMA_HOST_EXPERTS_MODE_AUTO   = -1, // pinned (the pageable mmap mode was removed; issue #116)
         LLAMA_HOST_EXPERTS_MODE_PINNED =  0, // keep them in the device's pinned host buffer (ROCm_Host) - fast path
         LLAMA_HOST_EXPERTS_MODE_MMAP   =  1, // REMOVED: pageable masters fault on no-XNACK GPUs (issue #116)
-        LLAMA_HOST_EXPERTS_MODE_POOL   =  2, // pinned master + a bounded pinned host pool (MOE_HOST_POOL_MIB)
+        LLAMA_HOST_EXPERTS_MODE_POOL   =  2, // NO full pinned master: the tensors live in the read-only model
+                                             // mapping and every GPU read is served through the bounded
+                                             // pinned host pool (MOE_HOST_POOL_MIB/FRAC).  Costs some prefill
+                                             // bandwidth, bounds the non-swappable footprint to the pool, and
+                                             // lets a host expert set larger than RAM run by streaming from
+                                             // disk.  Requires a mapped load (the default).
     };
 
     enum llama_context_type {
