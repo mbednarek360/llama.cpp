@@ -2765,15 +2765,32 @@ struct common_speculative_init_result::impl {
     llama_context_ptr context;
 };
 
+llama_model_ptr common_speculative_load_model(common_params & params) {
+    if (!params.speculative.has_dft()) {
+        return nullptr;   // MTP runs on the target model's weights
+    }
+    auto mparams = common_model_params_to_llama(params);
+    // The draft model's own host-expert placement (`--spec-draft-n-cpu-moe`), not the target's `-ncmoe`.
+    mparams.n_cpu_moe_from_end = params.speculative.draft.n_cpu_moe;
+    mparams.allow_nextn_cpu_offload = true;
+
+    const std::string model_path = params.speculative.draft.mparams.path;
+    LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
+    return llama_model_ptr(llama_model_load_from_file(model_path.c_str(), mparams));
+}
+
 common_speculative_init_result::common_speculative_init_result(
     common_params & params,
       llama_model * model_tgt,
-    llama_context * ctx_tgt) :
+    llama_context * ctx_tgt,
+    llama_model * model_dft_pre) :
     pimpl(new impl{}) {
     const bool has_draft = params.speculative.has_dft();
     const bool spec_mtp = params.speculative.has_mtp();
 
     auto mparams = common_model_params_to_llama(params);
+    // The draft model's own host-expert placement (`--spec-draft-n-cpu-moe`), not the target's `-ncmoe`.
+    mparams.n_cpu_moe_from_end = params.speculative.draft.n_cpu_moe;
     auto cparams = common_context_params_to_llama(params);
 
     if (spec_mtp) {
@@ -2803,9 +2820,22 @@ common_speculative_init_result::common_speculative_init_result(
     std::string model_path;
     if (has_draft) {
         model_path = params.speculative.draft.mparams.path;
-        LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
 
-        llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
+        // wip/slab-transient-absorption (step 4): `common_init_result` normally loads the draft model
+        // before the target context, so the slab is sized from the free VRAM measured with it resident.
+        // The fallback load below keeps other callers working unchanged.
+        llama_model * model_dft = model_dft_pre;
+        if (model_dft == nullptr) {
+            LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
+
+            // The separate draft model's own `--spec-draft-n-cpu-moe` / `--spec-draft-cpu-moe` must be
+            // honoured: allow its CPU overrides to match its nextn/MTP head layer.  (The main model's
+            // `-ncmoe` never lands here -- `common_base_params_to_speculative` replaced the overrides with
+            // the draft's -- but this makes the intent explicit.)
+            mparams.allow_nextn_cpu_offload = true;
+
+            model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
+        }
         if (model_dft == NULL) {
             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());
             return;
@@ -2833,6 +2863,15 @@ common_speculative_init_result::common_speculative_init_result(
 
         pimpl->context.reset(ctx_dft);
     }
+
+    // WIP r42 / stage 2 (TODO #42): the MTP draft context reserves its compute buffers at construction,
+    // sized for the target's full -ub (~1.7 GiB per device).  That resident dead weight is what makes
+    // the target's first-prefill compute growth (a contiguous ~11.8 GiB allocation) run out of VRAM on
+    // 2 GPUs.  Release the draft buffers here (before the target's first prefill); the draft is not used
+    // during the target's prefill and re-reserves lazily on its first real (n_max+1-token) graph.
+    if (spec_mtp && pimpl->context) {
+        llama_context_drop_compute_buffers(pimpl->context.get());
+    }
 }
 
 common_speculative_init_result::~common_speculative_init_result() = default;
@@ -2845,8 +2884,9 @@ llama_context * common_speculative_init_result::context() {
     return pimpl->context.get();
 }
 
-common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt) {
-    return std::make_unique<common_speculative_init_result>(params, model_tgt, ctx_tgt);
+common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt,
+                                                                       llama_model * model_dft) {
+    return std::make_unique<common_speculative_init_result>(params, model_tgt, ctx_tgt, model_dft);
 }
 
 common_speculative_output_limits common_speculative_get_output_limits(

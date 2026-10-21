@@ -117,8 +117,17 @@ struct common_speculative_deleter {
 
 typedef std::unique_ptr<common_speculative, common_speculative_deleter> common_speculative_ptr;
 
+// wip/slab-transient-absorption (step 4): load the draft MODEL only.  `common_init_result` calls this
+// BEFORE creating the target context, so the draft's weights are resident when the slab sizes itself from
+// the free VRAM it measures -- their per-device (asymmetric) footprint is then measured, not predicted.
+// The draft CONTEXT still comes after the target context (it needs `ctx_other`).  Returns nullptr when the
+// speculation runs on the target's own weights (MTP) or there is no draft.
+llama_model_ptr common_speculative_load_model(common_params & params);
+
 struct common_speculative_init_result {
-    common_speculative_init_result(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);
+    // `model_dft` (optional) is an already loaded draft model; ownership is transferred here.
+    common_speculative_init_result(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt,
+                                   llama_model * model_dft = nullptr);
     ~common_speculative_init_result();
 
     llama_model   * model();
@@ -131,4 +140,5 @@ private:
 
 using common_speculative_init_result_ptr = std::unique_ptr<common_speculative_init_result>;
 
-common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt);
+common_speculative_init_result_ptr common_speculative_init_from_params(common_params & params, llama_model * model_tgt, llama_context * ctx_tgt,
+                                                                       llama_model * model_dft = nullptr);
