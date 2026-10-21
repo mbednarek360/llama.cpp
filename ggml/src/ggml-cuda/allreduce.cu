@@ -1,6 +1,6 @@
 #include "allreduce.cuh"
 
-#if !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 #include "convert.cuh"
 #include "ggml-impl.h"
@@ -814,6 +814,9 @@ bool ggml_cuda_ar_allreduce(
         for (int i = 0; i < n; ++i) {
             auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
             GGML_ASSERT(cuda_ctx->device == p->devices[i]);
+            // wip/slab-transient-absorption (step 2b): this scratch is held across the copy-engine
+            // sub-launches of the whole all-reduce, so it must not come from the prefill-only wide band.
+            ggml_cuda_pool_wide_pin wide_pin(cuda_ctx->pool());
             bf16_tmp[i].pool = &cuda_ctx->pool();
             bf16_tmp[i].alloc(ne);
             ggml_cuda_set_device(p->devices[i]);
@@ -957,12 +960,12 @@ bool ggml_cuda_ar_allreduce(
     return ok;
 }
 
-#else // defined(GGML_USE_MUSA)
+#elif defined(GGML_USE_MUSA)
 
 // MUSA lacks the host-mapped pinned-memory APIs (cudaHostAllocPortable
-// / cudaHostAllocMapped / cudaHostGetDevicePointer) and a device-side
-// sleep intrinsic that this implementation relies on, so the internal
-// AllReduce is unavailable there. The dispatcher in ggml-cuda.cu treats
+// / cudaHostAllocMapped / cudaHostGetDevicePointer) that this implementation
+// relies on, so the internal AllReduce is a CUDA/HIP feature (see
+// allreduce-hip.cu for the HIP port).  The dispatcher in ggml-cuda.cu treats
 // a nullptr pipeline as "init failed" and silently falls back to the meta
 // backend's generic AllReduce.
 ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int *, size_t) {
@@ -974,4 +977,19 @@ bool ggml_cuda_ar_allreduce(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tens
     return false;
 }
 
-#endif // !defined(GGML_USE_MUSA)
+// WIP fused-stage hook: no-op on non-HIP builds (the internal AR is HIP-only).
+void ggml_cuda_ar_stage_hook_set(int device, ggml_cuda_ar_stage_fn fn, void * user_data) {
+    GGML_UNUSED(device);
+    GGML_UNUSED(fn);
+    GGML_UNUSED(user_data);
+}
+
+void ggml_cuda_ar_stage_hook_run(int device, cudaStream_t stream,
+                                 const float * data, int64_t count) {
+    GGML_UNUSED(device);
+    GGML_UNUSED(stream);
+    GGML_UNUSED(data);
+    GGML_UNUSED(count);
+}
+
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)

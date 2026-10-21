@@ -2,7 +2,8 @@
 
 #ifdef GGML_CUDA_USE_CUB
 #    include <cub/cub.cuh>
-#    if (CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 1)
+    // strided_iterator was added in CCCL 3.1
+#    if (CCCL_MAJOR_VERSION > 3 || (CCCL_MAJOR_VERSION == 3 && CCCL_MINOR_VERSION >= 1))
 #        define STRIDED_ITERATOR_AVAILABLE
 #        include <cuda/iterator>
 #    endif
@@ -27,20 +28,20 @@ static __global__ void init_offsets(int * offsets, const int ncols, const int nr
 }
 #endif  // STRIDED_ITERATOR_AVAILABLE
 
-#ifdef GGML_CUDA_USE_CUB
-
-// returns the suggested maximum number of rows to process during one argsort_f32_i32_cuda_cub() call
-int argsort_f32_i32_cuda_cub_chunk_nrows(const size_t nb01, const int64_t nrows) {
-    // perform argsort in chunks up to approximately this size (currently 64MB)
+// returns the suggested maximum number of rows to process at once, given the temporary buffer bytes per row
+int ggml_cuda_chunk_nrows(const size_t row_bytes, const int64_t nrows) {
+    // process rows in chunks up to approximately this size (currently 64MB)
     // to avoid excessive temporary buffers memory usage
     const int chunk_bytes = 1 << 26;
 
     // calculate how many rows will fit in one chunk (must be at least one)
-    const int chunk_nrows = std::max((int) (chunk_bytes / nb01), 1);
+    const int chunk_nrows = std::max((int) (chunk_bytes / row_bytes), 1);
 
     // limit the resulting amount to total nrows
     return std::min((int64_t) chunk_nrows, nrows);
 }
+
+#ifdef GGML_CUDA_USE_CUB
 
 void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
                               const float *    x,
@@ -173,11 +174,18 @@ static inline __device__ void bitonic_step(const float * x_row, int * dst_row, c
     if (ixj <= col) {
         return;
     }
+    // Break ties by index so the sort is deterministic (the CUB path is a stable radix
+    // sort, and the fused MoE router's iterative argmax also breaks ties by the smaller
+    // expert index; the plain bitonic network without this step is not stable, so an
+    // address-dependent fusion decision used to change the routed top-k).
+    const bool eq = dst_row[col] < ncols && dst_row[ixj] < ncols &&
+                    x_row[dst_row[col]] == x_row[dst_row[ixj]];
     if ((col & k) == 0) {
         if (dst_row[col] >= ncols ||
             (dst_row[ixj] < ncols && (order == GGML_SORT_ORDER_ASC ?
                 x_row[dst_row[col]] > x_row[dst_row[ixj]] :
-                x_row[dst_row[col]] < x_row[dst_row[ixj]]))
+                x_row[dst_row[col]] < x_row[dst_row[ixj]])) ||
+            (eq && dst_row[col] > dst_row[ixj])
         ) {
             ggml_cuda_swap(dst_row[col], dst_row[ixj]);
         }
@@ -185,7 +193,8 @@ static inline __device__ void bitonic_step(const float * x_row, int * dst_row, c
         if (dst_row[ixj] >= ncols ||
             (dst_row[col] < ncols && (order == GGML_SORT_ORDER_ASC ?
                 x_row[dst_row[col]] < x_row[dst_row[ixj]] :
-                x_row[dst_row[col]] > x_row[dst_row[ixj]]))
+                x_row[dst_row[col]] > x_row[dst_row[ixj]])) ||
+            (eq && dst_row[col] < dst_row[ixj])
         ) {
             ggml_cuda_swap(dst_row[col], dst_row[ixj]);
         }
@@ -289,7 +298,7 @@ void ggml_cuda_op_argsort(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         return;
     }
 
-    const int chunk_nrows = argsort_f32_i32_cuda_cub_chunk_nrows(src0->nb[1], nrows);
+    const int chunk_nrows = ggml_cuda_chunk_nrows(src0->nb[1], nrows);
 
     ggml_cuda_pool & pool = ctx.pool();
 

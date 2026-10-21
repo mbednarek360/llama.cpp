@@ -88,6 +88,17 @@ LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
+// wip/fit-slab-accounting (Phase 1): enumerate the REAL devices that own host-resident MoE expert
+// weights (the `moe_host_expert_bytes` map).  Under `-sm tensor` the model's device list is the
+// scheduler's Meta wrapper, so `llama_model_moe_host_expert_bytes()` sees 0 on every device; `--fit`
+// needs the per-real-device bytes to reserve the expert-cache arena and the slab headroom.
+LLAMA_API int32_t llama_model_moe_host_expert_dev_count(const struct llama_model * model);
+
+// Fill *dev/*bytes with the i-th host-expert device (map iteration order).  Returns false when i is out
+// of range.  Either out pointer may be null.
+LLAMA_API bool llama_model_moe_host_expert_dev(const struct llama_model * model, int32_t i,
+                                               ggml_backend_dev_t * dev, size_t * bytes);
+
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
 // Set whether the context outputs nextn embeddings or not
@@ -100,7 +111,7 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
-// Marks the entries that a joint decision head (clef) reads, the default is 0
+// Marks the entries that a decision head (clef, vllm-decision2) reads, the default is 0
 // See https://github.com/ggml-org/llama.cpp/pull/29831 for details
 // A run of entries with the same value is one span, spans must be separated by entries with value 0
 // An option belongs to the last question before it
@@ -128,6 +139,18 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
 
+// Llama-Frankenstein F1: device-resident layer inputs for draft feature injection
+LLAMA_API void                 llama_lf_set_layer_inp_dev(struct llama_context * ctx, bool enable);
+LLAMA_API struct ggml_tensor * llama_lf_get_layer_inp_dev(struct llama_context * ctx, uint32_t lid);
+// target context: the device buffer row of each row of its last batch, or nullptr when they are the same (the ubatches
+// kept the batch order: always for one sequence); *n_rows = the batch size when not nullptr
+LLAMA_API const int32_t *      llama_lf_get_dev_rows     (struct llama_context * ctx, int32_t * n_rows);
+// draft context: while enabled, a token batch is a KV injection whose token ids are the rows of the target's
+// last batch (its ctx_other) to read from the device layer inputs
+LLAMA_API void                 llama_lf_set_dev_inject   (struct llama_context * ctx, bool enable);
+// draft context: after the injections of a batch were enqueued; the target's next extraction waits for them on the GPU
+LLAMA_API void                 llama_lf_signal_features_consumed(struct llama_context * ctx_dft);
+
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
 //
@@ -140,6 +163,12 @@ LLAMA_API int32_t llama_model_dflash_selector_top_k(const struct llama_model * m
 LLAMA_API const int32_t * llama_model_target_layer_ids  (const struct llama_model * model);
 // returns the number of extracted layers from target model
 LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_model * model);
+
+// layers whose input embeddings contexts created from this model extract from the start (as if
+// llama_set_embeddings_layer_inp(ctx, lid, true) had been called before the context's first graph reserve).
+// For a target whose draft will turn the extraction on (DFlash): the compute buffers are then sized for it once,
+// instead of being freed and allocated again, larger, at the first decode after the draft attaches.
+LLAMA_API void llama_model_set_embeddings_layer_inp_preset(struct llama_model * model, const int32_t * lids, uint32_t n);
 
 // retrieves the whole token embedding matrix in F32 format (n_embd * n_vocab)
 // returns total number of elements or 0 on error

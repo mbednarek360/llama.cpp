@@ -44,7 +44,7 @@ int main(int argc, char ** argv) {
     llama_context * ctx_tgt = NULL;
 
     // load the target model
-    auto llama_init_tgt = common_init_from_params(params);
+    auto llama_init_tgt = common_init_from_params(params, /*model_only =*/ false, /*preload_draft =*/ true);
 
     model_tgt = llama_init_tgt->model();
     ctx_tgt   = llama_init_tgt->context();
@@ -57,7 +57,7 @@ int main(int argc, char ** argv) {
     {
         common_params params_dft = common_base_params_to_speculative(params);
 
-        spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
+        spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt, llama_init_tgt->take_draft_model());
 
         params.speculative.draft.ctx_tgt = ctx_tgt;
         params.speculative.draft.ctx_dft = spec_init->context();
@@ -206,7 +206,7 @@ int main(int argc, char ** argv) {
             // reset the draft context to the checkpoint before verification
             if (ctx_dft) {
                 if (use_ckpt_dft) {
-                    ckpt.load_dft(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    GGML_ASSERT(ckpt.load_dft(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
                 }
 
                 llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, ckpt.pos_max + 1, -1);
@@ -266,16 +266,20 @@ int main(int argc, char ** argv) {
         if (use_ckpt_tgt && ids.size() - 1 < n_draft) {
             LOG_DBG("partial acceptance: %zu < %zu, restoring checkpoint\n", ids.size() - 1, n_draft);
 
+            // the accepted tokens are replayed next round without a new draft() call;
+            // report the partial result now so speculators do not get stale feedback
+            common_speculative_accept_partial(spec, seq_id, ids.size() - 1);
+
             draft = std::move(ids);
 
             {
-                ckpt.load_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                GGML_ASSERT(ckpt.load_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
 
                 llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, ckpt.pos_max + 1, -1);
             }
 
             if (ctx_dft) {
-                ckpt.load_dft(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                GGML_ASSERT(ckpt.load_dft(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
 
                 llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, ckpt.pos_max + 1, -1);
             }

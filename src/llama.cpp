@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <stdexcept>
@@ -167,16 +168,21 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR needs >= 1 devices\n", __func__);
                 return false;
             }
-            LLAMA_LOG_INFO("%s: creating a Meta device with %zu devices\n", __func__, n_devs);
-            for (size_t i = 0; i < n_devs; ++i) {
-                LLAMA_LOG_INFO("%s: - device %zu: %s\n", __func__, i, ggml_backend_dev_name(params.devices[i]));
+            if (n_devs == 1) {
+                // single device: no tensor splitting is possible, skip the Meta wrapper
+                model->devices.push_back({false, params.devices[0]});
+            } else {
+                LLAMA_LOG_INFO("%s: creating a Meta device with %zu devices\n", __func__, n_devs);
+                for (size_t i = 0; i < n_devs; ++i) {
+                    LLAMA_LOG_INFO("%s: - device %zu: %s\n", __func__, i, ggml_backend_dev_name(params.devices[i]));
+                }
+                model->get_split_state_ud.n_devices = n_devs;
+                model->get_split_state_ud.model = model;
+                model->devices.push_back({
+                    true, ggml_backend_meta_device(
+                    params.devices, n_devs, llama_meta_device_get_split_state, &model->get_split_state_ud)
+                });
             }
-            model->get_split_state_ud.n_devices = n_devs;
-            model->get_split_state_ud.model = model;
-            model->devices.push_back({
-                true, ggml_backend_meta_device(
-                params.devices, n_devs, llama_meta_device_get_split_state, &model->get_split_state_ud)
-            });
         } else {
             for (ggml_backend_dev_t * dev = params.devices; *dev; ++dev) {
                 model->devices.push_back({false, *dev});
@@ -212,12 +218,17 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             }
 
             GGML_ASSERT(!devs.empty());
-            model->get_split_state_ud.n_devices = devs.size();
-            model->get_split_state_ud.model     = model;
-            gpus.push_back({
-                true, ggml_backend_meta_device(
-                devs.data(), devs.size(), llama_meta_device_get_split_state, &model->get_split_state_ud)
-            });
+            if (devs.size() == 1) {
+                // single device: no tensor splitting is possible, skip the Meta wrapper
+                gpus.push_back({false, devs[0]});
+            } else {
+                model->get_split_state_ud.n_devices = devs.size();
+                model->get_split_state_ud.model     = model;
+                gpus.push_back({
+                    true, ggml_backend_meta_device(
+                    devs.data(), devs.size(), llama_meta_device_get_split_state, &model->get_split_state_ud)
+                });
+            }
         } else {
             for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
                 ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -312,14 +323,29 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
     return true;
 }
 
+// managed PLE buffer size for the LAZY_MODE_AUTO reader, opt-in via LLAMA_LAZY_BUF_MB (MiB).
+// Unset (or non-positive) disables the managed reader: LAZY_MODE_AUTO then behaves as the
+// classic upstream auto (mmap lazy for large tensors where the mmap path is available).
+// The managed reader is kept for future work but is OFF by default because it measured slower
+// than both the mmap and the resident path on gfx1151 (see wip/closing-the-gap).
+static size_t llama_lazy_managed_budget() {
+    const char * env = getenv("LLAMA_LAZY_BUF_MB");
+    if (env == nullptr) {
+        return 0;
+    }
+    const long mb = strtol(env, nullptr, 10);
+    return mb > 0 ? (size_t) mb * 1024 * 1024 : 0;
+}
+
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
-            params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
+            params.host_experts_mode, params.check_tensors, params.no_alloc, params.load_mtp, params.allow_nextn_cpu_offload, params.n_cpu_moe_from_end, params.kv_overrides, params.tensor_buft_overrides);
 
-        ml.lazy.mode = params.lazy_mode;
+        ml.lazy.mode            = params.lazy_mode;
+        ml.lazy.managed_budget  = params.lazy_mode == LLAMA_LAZY_MODE_AUTO ? llama_lazy_managed_budget() : 0;
 
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
@@ -348,6 +374,17 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             model->load_hparams(ml);
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
+        }
+        // TODO #58: a DFlash2 drafter with a selector builds `ggml_top_k` over the draft logits, which
+        // `-sm tensor` vocab-splits (axis 0); the Meta backend cannot reduce a per-row op across a split
+        // axis and aborts in `ggml-backend-meta.cpp`.  Reject cleanly with a `-sm layer` hint instead of
+        // aborting mid-load.  A real Meta distributed-top-k / split-to-mirrored gather is tracked in
+        // `wip/dflash-meta-split/`.
+        if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR && model->arch == LLM_ARCH_DFLASH &&
+            model->hparams.dflash_selector_rank > 0) {
+            throw std::runtime_error("LLAMA_SPLIT_MODE_TENSOR is not supported for a DFlash2 drafter with a "
+                                     "selector: its per-row TOP_K over the vocab-split draft logits has no "
+                                     "tensor-split path -- use -sm layer for that config");
         }
         if (model->arch == LLM_ARCH_CLIP) {
             throw std::runtime_error("CLIP cannot be used as main model, use it with --mmproj instead");
@@ -439,6 +476,20 @@ static struct llama_model * llama_model_load_from_file_impl(
             llama_model_free(model);
         }
         return nullptr;
+    }
+
+    // Preflight the MoE expert cache / movable-boundary slab HERE so every consumer arms it.  This used
+    // to run only from `common_init_from_params`, which `llama-bench` (and tests, and API users) bypass,
+    // so llama-bench never armed the slab for ANY host-layer placement.  The draft/MTP aux estimate is
+    // only known from `common`, which calls the preflight again with the real value (the floor re-runs
+    // when the aux grows); the embedded MTP head is known here via `params.load_mtp`.
+    if (model != nullptr) {
+        size_t aux_bytes = 0;
+        if (params.load_mtp) {
+            const char * e = getenv("MOE_EXPERT_CACHE_AUX_RESERVE_MIB");
+            aux_bytes = (size_t) (e != nullptr ? atoll(e) : LLAMA_MOE_CACHE_AUX_RESERVE_MIB_DEFAULT) * 1024 * 1024;
+        }
+        llama_model_moe_cache_preflight(model, aux_bytes);
     }
 
     return model;

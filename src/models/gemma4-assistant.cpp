@@ -47,17 +47,17 @@ void llama_model_gemma4_assistant::load_arch_tensors(llama_model_loader &) {
     for (int i = 0; i < n_layer_nextn; ++i) {
         auto & layer = layers[i];
 
-        const int64_t n_head      = hparams.n_head(i);
+        const int64_t n_head_l      = hparams.n_head(i);
         const int64_t n_embd_head = hparams.n_embd_head_k(i);
-        const int64_t n_ff        = hparams.n_ff(i);
+        const int64_t n_ff_l        = hparams.n_ff(i);
 
         if (i == 0) {
             nextn_proj_pre = create_tensor(tn(LLM_TENSOR_NEXTN_PROJ_PRE, "weight", i), { 2*n_embd_backbone, n_embd }, 0);
         }
 
         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), { n_embd }, 0);
-        layer.wq        = create_tensor(tn(LLM_TENSOR_ATTN_Q,    "weight", i), { n_embd, n_embd_head*n_head }, 0);
-        layer.wo        = create_tensor(tn(LLM_TENSOR_ATTN_OUT,  "weight", i), { n_embd_head*n_head, n_embd }, 0);
+        layer.wq        = create_tensor(tn(LLM_TENSOR_ATTN_Q,    "weight", i), { n_embd, n_embd_head*n_head_l }, 0);
+        layer.wo        = create_tensor(tn(LLM_TENSOR_ATTN_OUT,  "weight", i), { n_embd_head*n_head_l, n_embd }, 0);
 
         layer.attn_q_norm    = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM,    "weight", i), { n_embd_head }, 0);
         layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), { n_embd }, 0);
@@ -70,9 +70,9 @@ void llama_model_gemma4_assistant::load_arch_tensors(llama_model_loader &) {
         }
 
         layer.ffn_norm      = create_tensor(tn(LLM_TENSOR_FFN_NORM,      "weight", i), { n_embd }, 0);
-        layer.ffn_gate      = create_tensor(tn(LLM_TENSOR_FFN_GATE,      "weight", i), { n_embd, n_ff }, 0);
-        layer.ffn_up        = create_tensor(tn(LLM_TENSOR_FFN_UP,        "weight", i), { n_embd, n_ff }, 0);
-        layer.ffn_down      = create_tensor(tn(LLM_TENSOR_FFN_DOWN,      "weight", i), { n_ff, n_embd }, 0);
+        layer.ffn_gate      = create_tensor(tn(LLM_TENSOR_FFN_GATE,      "weight", i), { n_embd, n_ff_l }, 0);
+        layer.ffn_up        = create_tensor(tn(LLM_TENSOR_FFN_UP,        "weight", i), { n_embd, n_ff_l }, 0);
+        layer.ffn_down      = create_tensor(tn(LLM_TENSOR_FFN_DOWN,      "weight", i), { n_ff_l, n_embd }, 0);
         layer.ffn_post_norm = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM, "weight", i), { n_embd }, 0);
     }
 }
@@ -86,9 +86,10 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
     const int64_t n_embd_backbone = hparams.n_embd_inp();
 
     ggml_tensor * inp_tokens;
+    ggml_tensor * inp_embd;
     ggml_tensor * inp_h;
     {
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd_backbone);
+        auto inp = std::make_unique<llm_graph_input_embd_h>(n_embd_backbone, n_embd_backbone);
 
         inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
         cb(inp->tokens, "inp_tokens", -1);
@@ -97,10 +98,15 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
         res->t_inp_tokens = inp->tokens;
 
         inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_backbone, ubatch.n_tokens);
-        cb(inp->embd, "inp_h", -1);
+        cb(inp->embd, "inp_embd", -1);
         ggml_set_input(inp->embd);
-        inp_h = inp->embd;
+        inp_embd = inp->embd;
         res->t_inp_embd = inp->embd;
+
+        inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_backbone, ubatch.n_tokens);
+        cb(inp->h, "inp_h", -1);
+        ggml_set_input(inp->h);
+        inp_h = inp->h;
 
         res->add_input(std::move(inp));
     }
@@ -108,7 +114,7 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
     GGML_ASSERT(cparams.ctx_other != nullptr);
     const auto * model_other = llama_get_model(cparams.ctx_other);
 
-    ggml_tensor * x = ggml_get_rows(ctx0, model_other->tok_embd, inp_tokens);
+    ggml_tensor * x = ubatch.token ? ggml_get_rows(ctx0, model_other->tok_embd, inp_tokens) : inp_embd;
     x = ggml_scale(ctx0, x, sqrtf((float) n_embd_backbone));
     cb(x, "inp_embd_target", -1);
 

@@ -69,6 +69,7 @@ static std::string llama_format_win_err(DWORD err) {
 struct llama_file::impl {
 #if defined(_WIN32)
     HANDLE fp_win32;
+    std::string fname;
     std::string GetErrorMessageWin32(DWORD error_code) const {
         std::string ret;
         LPSTR lpMsgBuf = NULL;
@@ -84,7 +85,7 @@ struct llama_file::impl {
         return ret;
     }
 
-    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) {
+    impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) : fname(fname) {
         fp = ggml_fopen(fname, mode);
         if (fp == NULL) {
             throw std::runtime_error(format("failed to open %s: %s", fname, strerror(errno)));
@@ -95,7 +96,7 @@ struct llama_file::impl {
         seek(0, SEEK_SET);
     }
 
-    impl(FILE * file) : owns_fp(false) {
+    impl(FILE * file) : fname("(file*)"), owns_fp(false) {
         fp = file;
         fp_win32 = (HANDLE) _get_osfhandle(_fileno(fp));
         seek(0, SEEK_END);
@@ -317,11 +318,11 @@ struct llama_file::impl {
         }
     }
 
-    void read_aligned_chunk(void * dest, size_t size) {
+    void read_aligned_chunk(void * dest, size_t size_l) {
         size_t offset = tell();
         off_t aligned_offset = offset & ~(alignment - 1);
         off_t offset_from_alignment = offset - aligned_offset;
-        size_t bytes_to_read = (offset_from_alignment + size + alignment - 1) & ~(alignment - 1);
+        size_t bytes_to_read = (offset_from_alignment + size_l + alignment - 1) & ~(alignment - 1);
 
         // stage through a bounded buffer, so that a large tensor is not held in memory twice while it loads
         const size_t buffer_size = std::min<size_t>(bytes_to_read, LLAMA_DIRECT_IO_BUFFER_SIZE);
@@ -345,7 +346,7 @@ struct llama_file::impl {
             const size_t n = std::min(buffer_size, bytes_to_read - done);
             read_raw_unsafe(buffer.get(), n);
 
-            const size_t count = std::min(n - skip, size - copied);
+            const size_t count = std::min(n - skip, size_l - copied);
             memcpy(reinterpret_cast<char *>(dest) + copied, reinterpret_cast<char *>(buffer.get()) + skip, count);
 
             copied += count;
@@ -418,6 +419,8 @@ llama_file::~llama_file() = default;
 
 size_t llama_file::tell() const { return pimpl->tell(); }
 size_t llama_file::size() const { return pimpl->size; }
+
+const std::string & llama_file::path() const { return pimpl->fname; }
 
 size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
 bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
@@ -553,22 +556,24 @@ struct llama_mmap::impl {
         GGML_ASSERT(last % page_size == 0);
         GGML_ASSERT(last > first);
 
-        void * next_page_start = (uint8_t *) addr + first;
-
-        if (munmap(next_page_start, len)) {
-            LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
-        }
-
+        // Only munmap the parts that are still mapped: a tensor whose data has been uploaded to a
+        // device is unmapped as soon as it is loaded, so the final offload cleanup must not munmap
+        // the same range twice (munmap of an unmapped range fails) and must keep the fragments
+        // pointing into the mapping intact.
         std::vector<std::pair<size_t, size_t>> new_mapped_fragments;
         for (const auto & frag : mapped_fragments) {
-            if (frag.first < first && frag.second > last) {
-                new_mapped_fragments.emplace_back(frag.first, first);
-                new_mapped_fragments.emplace_back(last, frag.second);
-            } else if (frag.first < first && frag.second > first) {
-                new_mapped_fragments.emplace_back(frag.first, first);
-            } else if (frag.first < last && frag.second > last) {
-                new_mapped_fragments.emplace_back(last, frag.second);
-            } else if (frag.first >= first && frag.second <= last) {
+            const size_t lo = std::max(frag.first, first);
+            const size_t hi = std::min(frag.second, last);
+            if (lo < hi) {
+                if (munmap((char *) addr + lo, hi - lo)) {
+                    LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
+                }
+                if (frag.first < first) {
+                    new_mapped_fragments.emplace_back(frag.first, first);
+                }
+                if (frag.second > last) {
+                    new_mapped_fragments.emplace_back(last, frag.second);
+                }
             } else {
                 new_mapped_fragments.push_back(frag);
             }
@@ -699,8 +704,8 @@ struct llama_mlock::impl {
         return (size_t) sysconf(_SC_PAGESIZE);
     }
 
-    bool raw_lock(const void * addr, size_t size) const {
-        if (!mlock(addr, size)) {
+    bool raw_lock(const void * addr_l, size_t size_l) const {
+        if (!mlock(addr_l, size_l)) {
             return true;
         }
 
@@ -724,13 +729,13 @@ struct llama_mlock::impl {
         if (suggest && getrlimit(RLIMIT_MEMLOCK, &lock_limit)) {
             suggest = false;
         }
-        if (suggest && ((uint64_t)lock_limit.rlim_max > (uint64_t)lock_limit.rlim_cur + size)) {
+        if (suggest && ((uint64_t)lock_limit.rlim_max > (uint64_t)lock_limit.rlim_cur + size_l)) {
             suggest = false;
         }
 #endif
 
         LLAMA_LOG_WARN("warning: failed to mlock %zu-byte buffer (after previously locking %zu bytes): %s\n%s",
-                size, this->size, errmsg, suggest ? MLOCK_SUGGESTION : "");
+                size_l, this->size, errmsg, suggest ? MLOCK_SUGGESTION : "");
         return false;
     }
 
