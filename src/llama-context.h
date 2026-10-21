@@ -168,6 +168,11 @@ struct llama_context {
     size_t state_seq_get_size(llama_seq_id seq_id, llama_state_seq_flags flags);
 
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
+
+    // batched state reads: a pinned host staging area of at least `size` bytes (nullptr if unavailable), and the
+    // backend that owns a state tensor's buffer (nullptr if none).  Fold (r96, PR #189).
+    uint8_t *      state_stage(size_t size);
+    ggml_backend_t state_backend(const ggml_tensor * t);
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
 
     bool state_load_file(
@@ -426,6 +431,10 @@ private:
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
+    // pinned staging for the batched state reads of llama_io_write_host (see state_stage).  Fold (r96, PR #189):
+    // retained across saves and one buffer per context (state saves on one context must not run concurrently).
+    ggml_backend_buffer_ptr buf_state_stage;
+
     // training
     ggml_opt_context_t opt_ctx = nullptr;
 
@@ -463,6 +472,10 @@ private:
     // without need (see the drop decision in `process_ubatch`).  Only written when a backend reports a slab
     // (`ggml_backend_dev_slab_work_size` != 0), so it stays empty on non-slab backends.
     std::map<ggml_backend_dev_t, size_t> slab_narrow_boundary;
+    // wip/slab-ring-region: the narrow (decode/verify) work floor was pinned before the first wide view
+    // was placed, so the slab could carve the H2D staging ring for the first prefill (not only after the
+    // first prefill -> decode transition).
+    bool slab_narrow_pinned = false;
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
