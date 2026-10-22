@@ -169,6 +169,7 @@ endif ()
 llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-recurrent-state-depth.cpp)
 llama_build(test-logits-width-probe.cpp)
+llama_build(test-mtp-draft-vocab.cpp) # needs a qwen35/qwen35moe model with an MTP head: -m MODEL
 # multi-sequence gate/beta fusion regression (issue #204): no model needed, skips without a CUDA device
 llama_build_and_test(test-fusion-gate-beta-multiseq.cpp LINK ggml)
 llama_build(test-save-load-state.cpp)
