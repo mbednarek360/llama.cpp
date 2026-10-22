@@ -169,6 +169,8 @@ endif ()
 llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-recurrent-state-depth.cpp)
 llama_build(test-logits-width-probe.cpp)
+# multi-sequence gate/beta fusion regression (issue #204): no model needed, skips without a CUDA device
+llama_build_and_test(test-fusion-gate-beta-multiseq.cpp LINK ggml)
 llama_build(test-save-load-state.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
@@ -216,6 +218,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
     llama_build(test-llama-archs.cpp)
+    llama_build_and_test(test-lazy-reader.cpp)
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
